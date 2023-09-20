@@ -105,10 +105,10 @@ public:
   }
 };
 
-void PlainPrinterBase::printHeader(uint64_t Address) {
-  if (Config.PrintAddress) {
+void PlainPrinterBase::printHeader(std::optional<uint64_t> Address) {
+  if (Address.has_value() && Config.PrintAddress) {
     OS << "0x";
-    OS.write_hex(Address);
+    OS.write_hex(*Address);
     StringRef Delimiter = Config.Pretty ? ": " : "\n";
     OS << Delimiter;
   }
@@ -144,11 +144,6 @@ void GNUPrinter::printSimpleLocation(StringRef Filename,
   OS << '\n';
   printContext(
       SourceCode(Filename, Info.Line, Config.SourceContextLines, Info.Source));
-}
-
-void GNUPrinter::printInvalidCommand(const Request &Request,
-                                     StringRef Command) {
-  OS << "??:0\n";
 }
 
 void PlainPrinterBase::printVerbose(StringRef Filename,
@@ -187,7 +182,7 @@ void PlainPrinterBase::print(const DILineInfo &Info, bool Inlined) {
 }
 
 void PlainPrinterBase::print(const Request &Request, const DILineInfo &Info) {
-  printHeader(*Request.Address);
+  printHeader(Request.Address);
   print(Info, false);
   printFooter();
 }
@@ -265,17 +260,9 @@ void PlainPrinterBase::print(const Request &Request,
   printFooter();
 }
 
-void PlainPrinterBase::printInvalidCommand(const Request &Request,
-                                           StringRef Command) {
-  OS << Command << '\n';
-}
-
 bool PlainPrinterBase::printError(const Request &Request,
-                                  const ErrorInfoBase &ErrorInfo,
-                                  StringRef ErrorBanner) {
-  ES << ErrorBanner;
-  ErrorInfo.log(ES);
-  ES << '\n';
+                                  const ErrorInfoBase &ErrorInfo) {
+  ErrHandler(ErrorInfo, Request.ModuleName);
   // Print an empty struct too.
   return true;
 }
@@ -375,17 +362,8 @@ void JSONPrinter::print(const Request &Request,
     printJSON(std::move(Json));
 }
 
-void JSONPrinter::printInvalidCommand(const Request &Request,
-                                      StringRef Command) {
-  printError(Request,
-             StringError("unable to parse arguments: " + Command,
-                         std::make_error_code(std::errc::invalid_argument)),
-             "");
-}
-
 bool JSONPrinter::printError(const Request &Request,
-                             const ErrorInfoBase &ErrorInfo,
-                             StringRef ErrorBanner) {
+                             const ErrorInfoBase &ErrorInfo) {
   json::Object Json = toJSON(Request, ErrorInfo.message());
   if (ObjectList)
     ObjectList->push_back(std::move(Json));

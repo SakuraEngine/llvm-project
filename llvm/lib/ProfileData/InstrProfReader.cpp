@@ -60,6 +60,9 @@ static InstrProfKind getProfileKindFromVersion(uint64_t Version) {
   if (Version & VARIANT_MASK_MEMPROF) {
     ProfileKind |= InstrProfKind::MemProf;
   }
+  if (Version & VARIANT_MASK_TEMPORAL_PROF) {
+    ProfileKind |= InstrProfKind::TemporalProfile;
+  }
   return ProfileKind;
 }
 
@@ -264,9 +267,53 @@ Error TextInstrProfReader::readHeader() {
       ProfileKind |= InstrProfKind::FunctionEntryInstrumentation;
     else if (Str.equals_insensitive("not_entry_first"))
       ProfileKind &= ~InstrProfKind::FunctionEntryInstrumentation;
-    else
+    else if (Str.equals_insensitive("temporal_prof_traces")) {
+      ProfileKind |= InstrProfKind::TemporalProfile;
+      if (auto Err = readTemporalProfTraceData())
+        return error(std::move(Err));
+    } else
       return error(instrprof_error::bad_header);
     ++Line;
+  }
+  return success();
+}
+
+/// Temporal profile trace data is stored in the header immediately after
+/// ":temporal_prof_traces". The first integer is the number of traces, the
+/// second integer is the stream size, then the following lines are the actual
+/// traces which consist of a weight and a comma separated list of function
+/// names.
+Error TextInstrProfReader::readTemporalProfTraceData() {
+  if ((++Line).is_at_end())
+    return error(instrprof_error::eof);
+
+  uint32_t NumTraces;
+  if (Line->getAsInteger(0, NumTraces))
+    return error(instrprof_error::malformed);
+
+  if ((++Line).is_at_end())
+    return error(instrprof_error::eof);
+
+  if (Line->getAsInteger(0, TemporalProfTraceStreamSize))
+    return error(instrprof_error::malformed);
+
+  for (uint32_t i = 0; i < NumTraces; i++) {
+    if ((++Line).is_at_end())
+      return error(instrprof_error::eof);
+
+    TemporalProfTraceTy Trace;
+    if (Line->getAsInteger(0, Trace.Weight))
+      return error(instrprof_error::malformed);
+
+    if ((++Line).is_at_end())
+      return error(instrprof_error::eof);
+
+    SmallVector<StringRef> FuncNames;
+    Line->split(FuncNames, ",", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+    for (auto &FuncName : FuncNames)
+      Trace.FunctionNameRefs.push_back(
+          IndexedInstrProf::ComputeHash(FuncName.trim()));
+    TemporalProfTraces.push_back(std::move(Trace));
   }
   return success();
 }
@@ -386,6 +433,29 @@ Error TextInstrProfReader::readNextRecord(NamedInstrProfRecord &Record) {
     Record.Counts.push_back(Count);
   }
 
+  // Bitmap byte information is indicated with special character.
+  if (Line->startswith("$")) {
+    Record.BitmapBytes.clear();
+    // Read the number of bitmap bytes.
+    uint64_t NumBitmapBytes;
+    if ((Line++)->drop_front(1).trim().getAsInteger(0, NumBitmapBytes))
+      return error(instrprof_error::malformed,
+                   "number of bitmap bytes is not a valid integer");
+    if (NumBitmapBytes != 0) {
+      // Read each bitmap and fill our internal storage with the values.
+      Record.BitmapBytes.reserve(NumBitmapBytes);
+      for (uint8_t I = 0; I < NumBitmapBytes; ++I) {
+        if (Line.is_at_end())
+          return error(instrprof_error::truncated);
+        uint8_t BitmapByte;
+        if ((Line++)->getAsInteger(0, BitmapByte))
+          return error(instrprof_error::malformed,
+                       "bitmap byte is not a valid integer");
+        Record.BitmapBytes.push_back(BitmapByte);
+      }
+    }
+  }
+
   // Check if value profile data exists and read it if so.
   if (Error E = readValueProfileData(Record))
     return error(std::move(E));
@@ -396,6 +466,25 @@ Error TextInstrProfReader::readNextRecord(NamedInstrProfRecord &Record) {
 template <class IntPtrT>
 InstrProfKind RawInstrProfReader<IntPtrT>::getProfileKind() const {
   return getProfileKindFromVersion(Version);
+}
+
+template <class IntPtrT>
+SmallVector<TemporalProfTraceTy> &
+RawInstrProfReader<IntPtrT>::getTemporalProfTraces(
+    std::optional<uint64_t> Weight) {
+  if (TemporalProfTimestamps.empty()) {
+    assert(TemporalProfTraces.empty());
+    return TemporalProfTraces;
+  }
+  // Sort functions by their timestamps to build the trace.
+  std::sort(TemporalProfTimestamps.begin(), TemporalProfTimestamps.end());
+  TemporalProfTraceTy Trace;
+  if (Weight)
+    Trace.Weight = *Weight;
+  for (auto &[TimestampValue, NameRef] : TemporalProfTimestamps)
+    Trace.FunctionNameRefs.push_back(NameRef);
+  TemporalProfTraces = {std::move(Trace)};
+  return TemporalProfTraces;
 }
 
 template <class IntPtrT>
@@ -466,7 +555,13 @@ Error RawInstrProfReader<IntPtrT>::readHeader(
     const RawInstrProf::Header &Header) {
   Version = swap(Header.Version);
   if (GET_VERSION(Version) != RawInstrProf::Version)
-    return error(instrprof_error::unsupported_version);
+    return error(instrprof_error::raw_profile_version_mismatch,
+                 ("Profile uses raw profile format version = " +
+                  Twine(GET_VERSION(Version)) +
+                  "; expected version = " + Twine(RawInstrProf::Version) +
+                  "\nPLEASE update this tool to version in the raw profile, or "
+                  "regenerate raw profile with expected version.")
+                     .str());
   if (useDebugInfoCorrelate() && !Correlator)
     return error(instrprof_error::missing_debug_info_for_correlation);
   if (!useDebugInfoCorrelate() && Correlator)
@@ -477,11 +572,14 @@ Error RawInstrProfReader<IntPtrT>::readHeader(
     return error(instrprof_error::bad_header);
 
   CountersDelta = swap(Header.CountersDelta);
+  BitmapDelta = swap(Header.BitmapDelta);
   NamesDelta = swap(Header.NamesDelta);
-  auto NumData = swap(Header.DataSize);
+  auto NumData = swap(Header.NumData);
   auto PaddingBytesBeforeCounters = swap(Header.PaddingBytesBeforeCounters);
-  auto CountersSize = swap(Header.CountersSize) * getCounterTypeSize();
+  auto CountersSize = swap(Header.NumCounters) * getCounterTypeSize();
   auto PaddingBytesAfterCounters = swap(Header.PaddingBytesAfterCounters);
+  auto NumBitmapBytes = swap(Header.NumBitmapBytes);
+  auto PaddingBytesAfterBitmapBytes = swap(Header.PaddingBytesAfterBitmapBytes);
   auto NamesSize = swap(Header.NamesSize);
   ValueKindLast = swap(Header.ValueKindLast);
 
@@ -491,8 +589,10 @@ Error RawInstrProfReader<IntPtrT>::readHeader(
   // Profile data starts after profile header and binary ids if exist.
   ptrdiff_t DataOffset = sizeof(RawInstrProf::Header) + BinaryIdsSize;
   ptrdiff_t CountersOffset = DataOffset + DataSize + PaddingBytesBeforeCounters;
-  ptrdiff_t NamesOffset =
+  ptrdiff_t BitmapOffset =
       CountersOffset + CountersSize + PaddingBytesAfterCounters;
+  ptrdiff_t NamesOffset =
+      BitmapOffset + NumBitmapBytes + PaddingBytesAfterBitmapBytes;
   ptrdiff_t ValueDataOffset = NamesOffset + NamesSize + PaddingSize;
 
   auto *Start = reinterpret_cast<const char *>(&Header);
@@ -521,6 +621,8 @@ Error RawInstrProfReader<IntPtrT>::readHeader(
       reinterpret_cast<const uint8_t *>(&Header) + sizeof(RawInstrProf::Header);
   CountersStart = Start + CountersOffset;
   CountersEnd = CountersStart + CountersSize;
+  BitmapStart = Start + BitmapOffset;
+  BitmapEnd = BitmapStart + NumBitmapBytes;
   ValueDataStart = reinterpret_cast<const uint8_t *>(Start + ValueDataOffset);
 
   const uint8_t *BufferEnd = (const uint8_t *)DataBuffer->getBufferEnd();
@@ -582,6 +684,23 @@ Error RawInstrProfReader<IntPtrT>::readRawCounts(
   for (uint32_t I = 0; I < NumCounters; I++) {
     const char *Ptr =
         CountersStart + CounterBaseOffset + I * getCounterTypeSize();
+    if (I == 0 && hasTemporalProfile()) {
+      uint64_t TimestampValue = swap(*reinterpret_cast<const uint64_t *>(Ptr));
+      if (TimestampValue != 0 &&
+          TimestampValue != std::numeric_limits<uint64_t>::max()) {
+        TemporalProfTimestamps.emplace_back(TimestampValue,
+                                            swap(Data->NameRef));
+        TemporalProfTraceStreamSize = 1;
+      }
+      if (hasSingleByteCoverage()) {
+        // In coverage mode, getCounterTypeSize() returns 1 byte but our
+        // timestamp field has size uint64_t. Increment I so that the next
+        // iteration of this for loop points to the byte after the timestamp
+        // field, i.e., I += 8.
+        I += 7;
+      }
+      continue;
+    }
     if (hasSingleByteCoverage()) {
       // A value of zero signifies the block is covered.
       Record.Counts.push_back(*Ptr == 0 ? 1 : 0);
@@ -589,6 +708,49 @@ Error RawInstrProfReader<IntPtrT>::readRawCounts(
       const auto *CounterValue = reinterpret_cast<const uint64_t *>(Ptr);
       Record.Counts.push_back(swap(*CounterValue));
     }
+  }
+
+  return success();
+}
+
+template <class IntPtrT>
+Error RawInstrProfReader<IntPtrT>::readRawBitmapBytes(InstrProfRecord &Record) {
+  uint32_t NumBitmapBytes = swap(Data->NumBitmapBytes);
+
+  Record.BitmapBytes.clear();
+  Record.BitmapBytes.reserve(NumBitmapBytes);
+
+  // It's possible MCDC is either not enabled or only used for some functions
+  // and not others. So if we record 0 bytes, just move on.
+  if (NumBitmapBytes == 0)
+    return success();
+
+  // BitmapDelta decreases as we advance to the next data record.
+  ptrdiff_t BitmapOffset = swap(Data->BitmapPtr) - BitmapDelta;
+  if (BitmapOffset < 0)
+    return error(
+        instrprof_error::malformed,
+        ("bitmap offset " + Twine(BitmapOffset) + " is negative").str());
+
+  if (BitmapOffset >= BitmapEnd - BitmapStart)
+    return error(instrprof_error::malformed,
+                 ("bitmap offset " + Twine(BitmapOffset) +
+                  " is greater than the maximum bitmap offset " +
+                  Twine(BitmapEnd - BitmapStart - 1))
+                     .str());
+
+  uint64_t MaxNumBitmapBytes =
+      (BitmapEnd - (BitmapStart + BitmapOffset)) / sizeof(uint8_t);
+  if (NumBitmapBytes > MaxNumBitmapBytes)
+    return error(instrprof_error::malformed,
+                 ("number of bitmap bytes " + Twine(NumBitmapBytes) +
+                  " is greater than the maximum number of bitmap bytes " +
+                  Twine(MaxNumBitmapBytes))
+                     .str());
+
+  for (uint32_t I = 0; I < NumBitmapBytes; I++) {
+    const char *Ptr = BitmapStart + BitmapOffset + I;
+    Record.BitmapBytes.push_back(swap(*Ptr));
   }
 
   return success();
@@ -632,7 +794,7 @@ Error RawInstrProfReader<IntPtrT>::readNextRecord(NamedInstrProfRecord &Record) 
     if (Error E = readNextHeader(getNextHeaderPos()))
       return error(std::move(E));
 
-  // Read name ad set it in Record.
+  // Read name and set it in Record.
   if (Error E = readName(Record))
     return error(std::move(E));
 
@@ -642,6 +804,10 @@ Error RawInstrProfReader<IntPtrT>::readNextRecord(NamedInstrProfRecord &Record) 
 
   // Read raw counts and set Record.
   if (Error E = readRawCounts(Record))
+    return error(std::move(E));
+
+  // Read raw bitmap bytes and set Record.
+  if (Error E = readRawBitmapBytes(Record))
     return error(std::move(E));
 
   // Read value data and set Record.
@@ -705,6 +871,7 @@ data_type InstrProfLookupTrait::ReadData(StringRef K, const unsigned char *D,
 
   DataBuffer.clear();
   std::vector<uint64_t> CounterBuffer;
+  std::vector<uint8_t> BitmapByteBuffer;
 
   const unsigned char *End = D + N;
   while (D < End) {
@@ -730,7 +897,24 @@ data_type InstrProfLookupTrait::ReadData(StringRef K, const unsigned char *D,
     for (uint64_t J = 0; J < CountsSize; ++J)
       CounterBuffer.push_back(endian::readNext<uint64_t, little, unaligned>(D));
 
-    DataBuffer.emplace_back(K, Hash, std::move(CounterBuffer));
+    // Read bitmap bytes for GET_VERSION(FormatVersion) > 8.
+    if (GET_VERSION(FormatVersion) > IndexedInstrProf::ProfVersion::Version8) {
+      uint64_t BitmapBytes = 0;
+      if (D + sizeof(uint64_t) > End)
+        return data_type();
+      BitmapBytes = endian::readNext<uint64_t, little, unaligned>(D);
+      // Read bitmap byte values.
+      if (D + BitmapBytes * sizeof(uint8_t) > End)
+        return data_type();
+      BitmapByteBuffer.clear();
+      BitmapByteBuffer.reserve(BitmapBytes);
+      for (uint64_t J = 0; J < BitmapBytes; ++J)
+        BitmapByteBuffer.push_back(static_cast<uint8_t>(
+            endian::readNext<uint64_t, little, unaligned>(D)));
+    }
+
+    DataBuffer.emplace_back(K, Hash, std::move(CounterBuffer),
+                            std::move(BitmapByteBuffer));
 
     // Read value profiling data.
     if (GET_VERSION(FormatVersion) > IndexedInstrProf::ProfVersion::Version2 &&
@@ -1061,6 +1245,40 @@ Error IndexedInstrProfReader::readHeader() {
                                         "corrupted binary ids");
   }
 
+  if (GET_VERSION(Header->formatVersion()) >= 10 &&
+      Header->formatVersion() & VARIANT_MASK_TEMPORAL_PROF) {
+    uint64_t TemporalProfTracesOffset =
+        endian::byte_swap<uint64_t, little>(Header->TemporalProfTracesOffset);
+    const unsigned char *Ptr = Start + TemporalProfTracesOffset;
+    const auto *PtrEnd = (const unsigned char *)DataBuffer->getBufferEnd();
+    // Expect at least two 64 bit fields: NumTraces, and TraceStreamSize
+    if (Ptr + 2 * sizeof(uint64_t) > PtrEnd)
+      return error(instrprof_error::truncated);
+    const uint64_t NumTraces =
+        support::endian::readNext<uint64_t, little, unaligned>(Ptr);
+    TemporalProfTraceStreamSize =
+        support::endian::readNext<uint64_t, little, unaligned>(Ptr);
+    for (unsigned i = 0; i < NumTraces; i++) {
+      // Expect at least two 64 bit fields: Weight and NumFunctions
+      if (Ptr + 2 * sizeof(uint64_t) > PtrEnd)
+        return error(instrprof_error::truncated);
+      TemporalProfTraceTy Trace;
+      Trace.Weight =
+          support::endian::readNext<uint64_t, little, unaligned>(Ptr);
+      const uint64_t NumFunctions =
+          support::endian::readNext<uint64_t, little, unaligned>(Ptr);
+      // Expect at least NumFunctions 64 bit fields
+      if (Ptr + NumFunctions * sizeof(uint64_t) > PtrEnd)
+        return error(instrprof_error::truncated);
+      for (unsigned j = 0; j < NumFunctions; j++) {
+        const uint64_t NameRef =
+            support::endian::readNext<uint64_t, little, unaligned>(Ptr);
+        Trace.FunctionNameRefs.push_back(NameRef);
+      }
+      TemporalProfTraces.push_back(std::move(Trace));
+    }
+  }
+
   // Load the remapping table now if requested.
   if (RemappingBuffer) {
     Remapper =
@@ -1082,7 +1300,8 @@ InstrProfSymtab &IndexedInstrProfReader::getSymtab() {
 
   std::unique_ptr<InstrProfSymtab> NewSymtab = std::make_unique<InstrProfSymtab>();
   if (Error E = Index->populateSymtab(*NewSymtab)) {
-    consumeError(error(InstrProfError::take(std::move(E))));
+    auto [ErrCode, Msg] = InstrProfError::take(std::move(E));
+    consumeError(error(ErrCode, Msg));
   }
 
   Symtab = std::move(NewSymtab);
@@ -1090,12 +1309,25 @@ InstrProfSymtab &IndexedInstrProfReader::getSymtab() {
 }
 
 Expected<InstrProfRecord> IndexedInstrProfReader::getInstrProfRecord(
-    StringRef FuncName, uint64_t FuncHash, uint64_t *MismatchedFuncSum) {
+    StringRef FuncName, uint64_t FuncHash, StringRef DeprecatedFuncName,
+    uint64_t *MismatchedFuncSum) {
   ArrayRef<NamedInstrProfRecord> Data;
   uint64_t FuncSum = 0;
-  Error Err = Remapper->getRecords(FuncName, Data);
-  if (Err)
-    return std::move(Err);
+  auto Err = Remapper->getRecords(FuncName, Data);
+  if (Err) {
+    // If we don't find FuncName, try DeprecatedFuncName to handle profiles
+    // built by older compilers.
+    auto Err2 =
+        handleErrors(std::move(Err), [&](const InstrProfError &IE) -> Error {
+          if (IE.get() != instrprof_error::unknown_function)
+            return make_error<InstrProfError>(IE);
+          if (auto Err = Remapper->getRecords(DeprecatedFuncName, Data))
+            return Err;
+          return Error::success();
+        });
+    if (Err2)
+      return std::move(Err2);
+  }
   // Found it. Look for counters with the right hash.
 
   // A flag to indicate if the records are from the same type
@@ -1179,6 +1411,16 @@ Error IndexedInstrProfReader::getFunctionCounts(StringRef FuncName,
     return error(std::move(E));
 
   Counts = Record.get().Counts;
+  return success();
+}
+
+Error IndexedInstrProfReader::getFunctionBitmapBytes(
+    StringRef FuncName, uint64_t FuncHash, std::vector<uint8_t> &BitmapBytes) {
+  Expected<InstrProfRecord> Record = getInstrProfRecord(FuncName, FuncHash);
+  if (Error E = Record.takeError())
+    return error(std::move(E));
+
+  BitmapBytes = Record.get().BitmapBytes;
   return success();
 }
 

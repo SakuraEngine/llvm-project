@@ -23,6 +23,7 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/ProfileSummary.h"
 #include "llvm/ProfileData/InstrProfData.inc"
+#include "llvm/Support/BalancedPartitioning.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Endian.h"
@@ -94,6 +95,9 @@ inline StringRef getInstrProfDataVarPrefix() { return "__profd_"; }
 
 /// Return the name prefix of profile counter variables.
 inline StringRef getInstrProfCountersVarPrefix() { return "__profc_"; }
+
+/// Return the name prefix of profile bitmap variables.
+inline StringRef getInstrProfBitmapVarPrefix() { return "__profbm_"; }
 
 /// Return the name prefix of value profile variables.
 inline StringRef getInstrProfValuesVarPrefix() { return "__profvp_"; }
@@ -182,6 +186,15 @@ std::string getPGOFuncName(StringRef RawFuncName,
                            GlobalValue::LinkageTypes Linkage,
                            StringRef FileName,
                            uint64_t Version = INSTR_PROF_INDEX_VERSION);
+
+/// \return the modified name for function \c F suitable to be
+/// used as the key for IRPGO profile lookup. \c InLTO indicates if this is
+/// called from LTO optimization passes.
+std::string getIRPGOFuncName(const Function &F, bool InLTO = false);
+
+/// \return the filename and the function name parsed from the output of
+/// \c getIRPGOFuncName()
+std::pair<StringRef, StringRef> getParsedIRPGOFuncName(StringRef IRPGOFuncName);
 
 /// Return the name of the global variable used to store a function
 /// name in PGO instrumentation. \c FuncName is the name of the function
@@ -300,7 +313,9 @@ enum class InstrProfKind {
   FunctionEntryOnly = 0x20,
   // A memory profile collected using -fprofile=memory.
   MemProf = 0x40,
-  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/MemProf)
+  // A temporal profile.
+  TemporalProfile = 0x80,
+  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/TemporalProfile)
 };
 
 const std::error_category &instrprof_category();
@@ -323,12 +338,30 @@ enum class instrprof_error {
   invalid_prof,
   hash_mismatch,
   count_mismatch,
+  bitmap_mismatch,
   counter_overflow,
   value_site_count_mismatch,
   compress_failed,
   uncompress_failed,
   empty_raw_profile,
-  zlib_unavailable
+  zlib_unavailable,
+  raw_profile_version_mismatch
+};
+
+/// An ordered list of functions identified by their NameRef found in
+/// INSTR_PROF_DATA
+struct TemporalProfTraceTy {
+  std::vector<uint64_t> FunctionNameRefs;
+  uint64_t Weight;
+  TemporalProfTraceTy(std::initializer_list<uint64_t> Trace = {},
+                      uint64_t Weight = 1)
+      : FunctionNameRefs(Trace), Weight(Weight) {}
+
+  /// Use a set of temporal profile traces to create a list of balanced
+  /// partitioning function nodes used by BalancedPartitioning to generate a
+  /// function order that reduces page faults during startup
+  static std::vector<BPFunctionNode>
+  createBPFunctionNodes(ArrayRef<TemporalProfTraceTy> Traces);
 };
 
 inline std::error_code make_error_code(instrprof_error E) {
@@ -353,15 +386,18 @@ public:
   instrprof_error get() const { return Err; }
   const std::string &getMessage() const { return Msg; }
 
-  /// Consume an Error and return the raw enum value contained within it. The
-  /// Error must either be a success value, or contain a single InstrProfError.
-  static instrprof_error take(Error E) {
+  /// Consume an Error and return the raw enum value contained within it, and
+  /// the optional error message. The Error must either be a success value, or
+  /// contain a single InstrProfError.
+  static std::pair<instrprof_error, std::string> take(Error E) {
     auto Err = instrprof_error::success;
-    handleAllErrors(std::move(E), [&Err](const InstrProfError &IPE) {
+    std::string Msg = "";
+    handleAllErrors(std::move(E), [&Err, &Msg](const InstrProfError &IPE) {
       assert(Err == instrprof_error::success && "Multiple errors encountered");
       Err = IPE.get();
+      Msg = IPE.getMessage();
     });
-    return Err;
+    return {Err, Msg};
   }
 
   static char ID;
@@ -369,61 +405,6 @@ public:
 private:
   instrprof_error Err;
   std::string Msg;
-};
-
-class SoftInstrProfErrors {
-  /// Count the number of soft instrprof_errors encountered and keep track of
-  /// the first such error for reporting purposes.
-
-  /// The first soft error encountered.
-  instrprof_error FirstError = instrprof_error::success;
-
-  /// The number of hash mismatches.
-  unsigned NumHashMismatches = 0;
-
-  /// The number of count mismatches.
-  unsigned NumCountMismatches = 0;
-
-  /// The number of counter overflows.
-  unsigned NumCounterOverflows = 0;
-
-  /// The number of value site count mismatches.
-  unsigned NumValueSiteCountMismatches = 0;
-
-public:
-  SoftInstrProfErrors() = default;
-
-  ~SoftInstrProfErrors() {
-    assert(FirstError == instrprof_error::success &&
-           "Unchecked soft error encountered");
-  }
-
-  /// Track a soft error (\p IE) and increment its associated counter.
-  void addError(instrprof_error IE);
-
-  /// Get the number of hash mismatches.
-  unsigned getNumHashMismatches() const { return NumHashMismatches; }
-
-  /// Get the number of count mismatches.
-  unsigned getNumCountMismatches() const { return NumCountMismatches; }
-
-  /// Get the number of counter overflows.
-  unsigned getNumCounterOverflows() const { return NumCounterOverflows; }
-
-  /// Get the number of value site count mismatches.
-  unsigned getNumValueSiteCountMismatches() const {
-    return NumValueSiteCountMismatches;
-  }
-
-  /// Return the first encountered error and reset FirstError to a success
-  /// value.
-  Error takeError() {
-    if (FirstError == instrprof_error::success)
-      return Error::success();
-    auto E = make_error<InstrProfError>(FirstError);
-    FirstError = instrprof_error::success;
-    return E;
-  }
 };
 
 namespace object {
@@ -465,6 +446,8 @@ private:
   static StringRef getExternalSymbol() {
     return "** External Symbol **";
   }
+
+  Error addFuncWithName(Function &F, StringRef PGOFuncName);
 
   // If the symtab is created by a series of calls to \c addFuncName, \c
   // finalizeSymtab needs to be called before looking up function names.
@@ -548,19 +531,11 @@ public:
   /// Return function from the name's md5 hash. Return nullptr if not found.
   inline Function *getFunction(uint64_t FuncMD5Hash);
 
-  /// Return the function's original assembly name by stripping off
-  /// the prefix attached (to symbols with priviate linkage). For
-  /// global functions, it returns the same string as getFuncName.
-  inline StringRef getOrigFuncName(uint64_t FuncMD5Hash);
-
   /// Return the name section data.
   inline StringRef getNameData() const { return Data; }
 
   /// Dump the symbols in this table.
-  void dumpNames(raw_ostream &OS) const {
-    for (StringRef S : NameTab.keys())
-      OS << S << "\n";
-  }
+  void dumpNames(raw_ostream &OS) const;
 };
 
 Error InstrProfSymtab::create(StringRef D, uint64_t BaseAddr) {
@@ -619,16 +594,6 @@ Function* InstrProfSymtab::getFunction(uint64_t FuncMD5Hash) {
   if (Result != MD5FuncMap.end() && Result->first == FuncMD5Hash)
     return Result->second;
   return nullptr;
-}
-
-// See also getPGOFuncName implementation. These two need to be
-// matched.
-StringRef InstrProfSymtab::getOrigFuncName(uint64_t FuncMD5Hash) {
-  StringRef PGOName = getFuncName(FuncMD5Hash);
-  size_t S = PGOName.find_first_of(':');
-  if (S == StringRef::npos)
-    return PGOName;
-  return PGOName.drop_front(S + 1);
 }
 
 // To store the sums of profile count values, or the percentage of
@@ -729,18 +694,23 @@ struct InstrProfValueSiteRecord {
 /// Profiling information for a single function.
 struct InstrProfRecord {
   std::vector<uint64_t> Counts;
+  std::vector<uint8_t> BitmapBytes;
 
   InstrProfRecord() = default;
   InstrProfRecord(std::vector<uint64_t> Counts) : Counts(std::move(Counts)) {}
+  InstrProfRecord(std::vector<uint64_t> Counts,
+                  std::vector<uint8_t> BitmapBytes)
+      : Counts(std::move(Counts)), BitmapBytes(std::move(BitmapBytes)) {}
   InstrProfRecord(InstrProfRecord &&) = default;
   InstrProfRecord(const InstrProfRecord &RHS)
-      : Counts(RHS.Counts),
+      : Counts(RHS.Counts), BitmapBytes(RHS.BitmapBytes),
         ValueData(RHS.ValueData
                       ? std::make_unique<ValueProfData>(*RHS.ValueData)
                       : nullptr) {}
   InstrProfRecord &operator=(InstrProfRecord &&) = default;
   InstrProfRecord &operator=(const InstrProfRecord &RHS) {
     Counts = RHS.Counts;
+    BitmapBytes = RHS.BitmapBytes;
     if (!RHS.ValueData) {
       ValueData = nullptr;
       return *this;
@@ -919,6 +889,11 @@ struct NamedInstrProfRecord : InstrProfRecord {
   NamedInstrProfRecord(StringRef Name, uint64_t Hash,
                        std::vector<uint64_t> Counts)
       : InstrProfRecord(std::move(Counts)), Name(Name), Hash(Hash) {}
+  NamedInstrProfRecord(StringRef Name, uint64_t Hash,
+                       std::vector<uint64_t> Counts,
+                       std::vector<uint8_t> BitmapBytes)
+      : InstrProfRecord(std::move(Counts), std::move(BitmapBytes)), Name(Name),
+        Hash(Hash) {}
 
   static bool hasCSFlagInHash(uint64_t FuncHash) {
     return ((FuncHash >> CS_FLAG_IN_FUNC_HASH) & 1);
@@ -1052,7 +1027,11 @@ enum ProfVersion {
   Version8 = 8,
   // Binary ids are added.
   Version9 = 9,
-  // The current version is 9.
+  // An additional (optional) temporal profile traces section is added.
+  Version10 = 10,
+  // An additional field is used for bitmap bytes.
+  Version11 = 11,
+  // The current version is 11.
   CurrentVersion = INSTR_PROF_INDEX_VERSION
 };
 const uint64_t Version = ProfVersion::CurrentVersion;
@@ -1071,6 +1050,7 @@ struct Header {
   uint64_t HashOffset;
   uint64_t MemProfOffset;
   uint64_t BinaryIdOffset;
+  uint64_t TemporalProfTracesOffset;
   // New fields should only be added at the end to ensure that the size
   // computation is correct. The methods below need to be updated to ensure that
   // the new field is read correctly.
@@ -1189,6 +1169,7 @@ namespace RawInstrProf {
 // Version 6: Added binary id.
 // Version 7: Reorder binary id and include version in signature.
 // Version 8: Use relative counter pointer.
+// Version 9: Added relative bitmap bytes pointer and count used by MC/DC.
 const uint64_t Version = INSTR_PROF_RAW_VERSION;
 
 template <class IntPtrT> inline uint64_t getMagic();
@@ -1220,10 +1201,6 @@ struct Header {
 };
 
 } // end namespace RawInstrProf
-
-// Parse MemOP Size range option.
-void getMemOPSizeRangeFromOption(StringRef Str, int64_t &RangeStart,
-                                 int64_t &RangeLast);
 
 // Create the variable for the profile file name.
 void createProfileFileNameVar(Module &M, StringRef InstrProfileOutput);

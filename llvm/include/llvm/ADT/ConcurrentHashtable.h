@@ -77,7 +77,7 @@ class ConcurrentHashTableInfoByPtr {
 public:
   /// \returns Hash value for the specified \p Key.
   static inline uint64_t getHashValue(const KeyTy &Key) {
-    return xxHash64(Key);
+    return xxh3_64bits(Key);
   }
 
   /// \returns true if both \p LHS and \p RHS are equal.
@@ -154,7 +154,7 @@ public:
     MaxBucketSize = 1Ull << (std::min((size_t)31, LeadingZerosNumber));
 
     // Calculate mask for extended hash bits.
-    ExtHashMask = (NumberOfBuckets * MaxBucketSize) - 1;
+    ExtHashMask = (uint64_t)NumberOfBuckets * MaxBucketSize - 1;
   }
 
   virtual ~ConcurrentHashTableByPtr() {
@@ -175,8 +175,10 @@ public:
     Bucket &CurBucket = BucketsArray[getBucketIdx(Hash)];
     uint32_t ExtHashBits = getExtHashBits(Hash);
 
+#if LLVM_ENABLE_THREADS
     // Lock bucket.
     CurBucket.Guard.lock();
+#endif
 
     HashesPtr BucketHashes = CurBucket.Hashes;
     DataPtr BucketEntries = CurBucket.Entries;
@@ -194,7 +196,9 @@ public:
         CurBucket.NumberOfEntries++;
         RehashBucket(CurBucket);
 
+#if LLVM_ENABLE_THREADS
         CurBucket.Guard.unlock();
+#endif
 
         return {NewData, true};
       }
@@ -204,7 +208,9 @@ public:
         KeyDataTy *EntryData = BucketEntries[CurEntryIdx];
         if (Info::isEqual(Info::getKey(*EntryData), NewValue)) {
           // Already existed entry matched with inserted data is found.
+#if LLVM_ENABLE_THREADS
           CurBucket.Guard.unlock();
+#endif
 
           return {EntryData, false};
         }
@@ -283,8 +289,10 @@ protected:
     // [Size] entries.
     DataPtr Entries = nullptr;
 
+#if LLVM_ENABLE_THREADS
     // Mutex for this bucket.
     std::mutex Guard;
+#endif
   };
 
   // Reallocate and rehash bucket if this is full enough.

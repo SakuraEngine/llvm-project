@@ -52,19 +52,21 @@ public:
 
   LogicalResult matchAndRewrite(vector::CreateMaskOp op,
                                 PatternRewriter &rewriter) const override {
-    auto dstType = op.getResult().getType().cast<VectorType>();
+    auto dstType = cast<VectorType>(op.getResult().getType());
     int64_t rank = dstType.getRank();
     if (rank <= 1)
       return rewriter.notifyMatchFailure(
           op, "0-D and 1-D vectors are handled separately");
 
+    if (dstType.getScalableDims().front())
+      return rewriter.notifyMatchFailure(
+          op, "Cannot unroll leading scalable dim in dstType");
+
     auto loc = op.getLoc();
-    auto eltType = dstType.getElementType();
     int64_t dim = dstType.getDimSize(0);
     Value idx = op.getOperand(0);
 
-    VectorType lowType =
-        VectorType::get(dstType.getShape().drop_front(), eltType);
+    VectorType lowType = VectorType::Builder(dstType).dropDim(0);
     Value trueVal = rewriter.create<vector::CreateMaskOp>(
         loc, lowType, op.getOperands().drop_front());
     Value falseVal = rewriter.create<arith::ConstantOp>(
@@ -77,9 +79,7 @@ public:
       Value val = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
                                                  bnd, idx);
       Value sel = rewriter.create<arith::SelectOp>(loc, val, trueVal, falseVal);
-      auto pos = rewriter.getI64ArrayAttr(d);
-      result =
-          rewriter.create<vector::InsertOp>(loc, dstType, sel, result, pos);
+      result = rewriter.create<vector::InsertOp>(loc, dstType, sel, result, d);
     }
     rewriter.replaceOp(op, result);
     return success();
@@ -112,7 +112,7 @@ public:
     if (rank == 0) {
       assert(dimSizes.size() == 1 &&
              "Expected exactly one dim size for a 0-D vector");
-      bool value = dimSizes[0].cast<IntegerAttr>().getInt() == 1;
+      bool value = cast<IntegerAttr>(dimSizes[0]).getInt() == 1;
       rewriter.replaceOpWithNewOp<arith::ConstantOp>(
           op, dstType,
           DenseIntElementsAttr::get(
@@ -122,14 +122,14 @@ public:
     }
 
     // Scalable constant masks can only be lowered for the "none set" case.
-    if (dstType.cast<VectorType>().isScalable()) {
+    if (cast<VectorType>(dstType).isScalable()) {
       rewriter.replaceOpWithNewOp<arith::ConstantOp>(
           op, DenseElementsAttr::get(dstType, false));
       return success();
     }
 
     int64_t trueDim = std::min(dstType.getDimSize(0),
-                               dimSizes[0].cast<IntegerAttr>().getInt());
+                               cast<IntegerAttr>(dimSizes[0]).getInt());
 
     if (rank == 1) {
       // Express constant 1-D case in explicit vector form:
@@ -146,16 +146,14 @@ public:
         VectorType::get(dstType.getShape().drop_front(), eltType);
     SmallVector<int64_t> newDimSizes;
     for (int64_t r = 1; r < rank; r++)
-      newDimSizes.push_back(dimSizes[r].cast<IntegerAttr>().getInt());
+      newDimSizes.push_back(cast<IntegerAttr>(dimSizes[r]).getInt());
     Value trueVal = rewriter.create<vector::ConstantMaskOp>(
         loc, lowType, rewriter.getI64ArrayAttr(newDimSizes));
     Value result = rewriter.create<arith::ConstantOp>(
         loc, dstType, rewriter.getZeroAttr(dstType));
-    for (int64_t d = 0; d < trueDim; d++) {
-      auto pos = rewriter.getI64ArrayAttr(d);
+    for (int64_t d = 0; d < trueDim; d++)
       result =
-          rewriter.create<vector::InsertOp>(loc, dstType, trueVal, result, pos);
-    }
+          rewriter.create<vector::InsertOp>(loc, dstType, trueVal, result, d);
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -191,7 +189,7 @@ struct MaskOpRewritePattern : OpRewritePattern<MaskOp> {
 private:
   LogicalResult matchAndRewrite(MaskOp maskOp,
                                 PatternRewriter &rewriter) const final {
-    MaskableOpInterface maskableOp = maskOp.getMaskableOp();
+    auto maskableOp = cast<MaskableOpInterface>(maskOp.getMaskableOp());
     SourceOp sourceOp = dyn_cast<SourceOp>(maskableOp.getOperation());
     if (!sourceOp)
       return failure();

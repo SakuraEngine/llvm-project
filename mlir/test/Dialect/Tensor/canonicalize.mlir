@@ -1,5 +1,28 @@
 // RUN: mlir-opt %s -split-input-file -canonicalize="test-convergence" | FileCheck %s
 
+// CHECK-LABEL: @tensor_bitcast_chain_ok
+// CHECK-SAME: %[[IN:.*]]: tensor<2xi32>
+func.func @tensor_bitcast_chain_ok(%input: tensor<2xi32>) -> tensor<2xf32> {
+  // CHECK-NEXT: %[[RES:.*]] = tensor.bitcast %[[IN]] : tensor<2xi32> to tensor<2xf32>
+  %0 = tensor.bitcast %input : tensor<2xi32> to tensor<2xui32>
+  %1 = tensor.bitcast %0 : tensor<2xui32> to tensor<2xf32>
+  // CHECK-NEXT: return %[[RES]]
+  return %1 : tensor<2xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @tensor_bitcast_chain_nop
+// CHECK-SAME: %[[IN:.*]]: tensor<4xi32>
+func.func @tensor_bitcast_chain_nop(%input: tensor<4xi32>) -> tensor<4xi32> {
+  %0 = tensor.bitcast %input : tensor<4xi32> to tensor<4xui32>
+  %1 = tensor.bitcast %0 : tensor<4xui32> to tensor<4xi32>
+  // CHECK-NEXT: return %[[IN]]
+  return %1 : tensor<4xi32>
+}
+
+// -----
+
 // Checks that NOP casts are removed.
 // CHECK-LABEL: cast_values
 func.func @cast_values(%arg0: tensor<*xi32>) -> tensor<2xi32> {
@@ -1824,4 +1847,17 @@ func.func @pack_unpack_dynamic_with_padding(%t: tensor<?x?x?x?xf32>, %dim1: inde
   %tensor_empty1 = tensor.empty(%dim3, %dim4, %dim5, %dim6) : tensor<?x?x?x?xf32>
   %packed = tensor.pack %unpacked padding_value(%pad: f32) inner_dims_pos = [0, 1] inner_tiles = [%tile1, %tile2] into %tensor_empty1 : tensor<?x?xf32> -> tensor<?x?x?x?xf32>
   return %packed : tensor<?x?x?x?xf32>
+}
+
+// -----
+
+// CHECK: func.func @invalid_empty_negative_size
+// CHECK: %[[IDX:.*]] = index.constant
+// CHECK: %[[T:.*]] = tensor.empty(%[[IDX]]) : tensor<4x5x?xf32>
+func.func @invalid_empty_negative_size() -> (tensor<4x5x?xf32>) {
+  %c1 = arith.constant 1 : index
+  %cn2 = arith.constant 2 : index
+  %0 = index.sub %c1, %cn2
+  %1 = tensor.empty(%0) : tensor<4x5x?xf32>
+  return %1 : tensor<4x5x?xf32>
 }

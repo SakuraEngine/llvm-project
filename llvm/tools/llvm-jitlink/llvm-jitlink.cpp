@@ -28,8 +28,10 @@
 #include "llvm/ExecutionEngine/Orc/MachOPlatform.h"
 #include "llvm/ExecutionEngine/Orc/MapperJITLinkMemoryManager.h"
 #include "llvm/ExecutionEngine/Orc/ObjectFileInterface.h"
+#include "llvm/ExecutionEngine/Orc/PerfSupportPlugin.h"
 #include "llvm/ExecutionEngine/Orc/Shared/OrcRTBridge.h"
 #include "llvm/ExecutionEngine/Orc/TargetProcess/JITLoaderGDB.h"
+#include "llvm/ExecutionEngine/Orc/TargetProcess/JITLoaderPerf.h"
 #include "llvm/ExecutionEngine/Orc/TargetProcess/RegisterEHFrames.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
@@ -140,6 +142,11 @@ static cl::opt<bool>
                     cl::desc("Enable debugger suppport (default = !-noexec)"),
                     cl::init(true), cl::Hidden, cl::cat(JITLinkCategory));
 
+static cl::opt<bool> PerfSupport("perf-support",
+                                 cl::desc("Enable perf profiling support"),
+                                 cl::init(false), cl::Hidden,
+                                 cl::cat(JITLinkCategory));
+
 static cl::opt<bool>
     NoProcessSymbols("no-process-syms",
                      cl::desc("Do not resolve to llvm-jitlink process symbols"),
@@ -180,11 +187,6 @@ static cl::opt<std::string> ShowLinkGraphs(
     cl::desc("Takes a posix regex and prints the link graphs of all files "
              "matching that regex after fixups have been applied"),
     cl::Optional, cl::cat(JITLinkCategory));
-
-static cl::opt<bool> ShowSizes(
-    "show-sizes",
-    cl::desc("Show sizes pre- and post-dead stripping, and allocations"),
-    cl::init(false), cl::cat(JITLinkCategory));
 
 static cl::opt<bool> ShowTimes("show-times",
                                cl::desc("Show times for llvm-jitlink phases"),
@@ -248,10 +250,14 @@ static cl::opt<bool> UseSharedMemory(
 static ExitOnError ExitOnErr;
 
 static LLVM_ATTRIBUTE_USED void linkComponents() {
-  errs() << (void *)&llvm_orc_registerEHFrameSectionWrapper
-         << (void *)&llvm_orc_deregisterEHFrameSectionWrapper
-         << (void *)&llvm_orc_registerJITLoaderGDBWrapper
-         << (void *)&llvm_orc_registerJITLoaderGDBAllocAction;
+  errs() << "Linking in runtime functions\n"
+         << (void *)&llvm_orc_registerEHFrameSectionWrapper << '\n'
+         << (void *)&llvm_orc_deregisterEHFrameSectionWrapper << '\n'
+         << (void *)&llvm_orc_registerJITLoaderGDBWrapper << '\n'
+         << (void *)&llvm_orc_registerJITLoaderGDBAllocAction << '\n'
+         << (void *)&llvm_orc_registerJITLoaderPerfStart << '\n'
+         << (void *)&llvm_orc_registerJITLoaderPerfEnd << '\n'
+         << (void *)&llvm_orc_registerJITLoaderPerfImpl << '\n';
 }
 
 static bool UseTestResultOverride = false;
@@ -386,13 +392,6 @@ static Error applyHarnessPromotions(Session &S, LinkGraph &G) {
     G.makeExternal(*Sym);
 
   return Error::success();
-}
-
-static uint64_t computeTotalBlockSizes(LinkGraph &G) {
-  uint64_t TotalSize = 0;
-  for (auto *B : G.blocks())
-    TotalSize += B->getSize();
-  return TotalSize;
 }
 
 static void dumpSectionContents(raw_ostream &OS, LinkGraph &G) {
@@ -554,12 +553,12 @@ Expected<uint64_t> getSlabAllocSize(StringRef SizeString) {
 
   uint64_t Units = 1024;
 
-  if (SizeString.endswith_insensitive("kb"))
+  if (SizeString.ends_with_insensitive("kb"))
     SizeString = SizeString.drop_back(2).rtrim();
-  else if (SizeString.endswith_insensitive("mb")) {
+  else if (SizeString.ends_with_insensitive("mb")) {
     Units = 1024 * 1024;
     SizeString = SizeString.drop_back(2).rtrim();
-  } else if (SizeString.endswith_insensitive("gb")) {
+  } else if (SizeString.ends_with_insensitive("gb")) {
     Units = 1024 * 1024 * 1024;
     SizeString = SizeString.drop_back(2).rtrim();
   }
@@ -893,7 +892,8 @@ public:
   }
 };
 
-Expected<std::unique_ptr<Session>> Session::Create(Triple TT) {
+Expected<std::unique_ptr<Session>> Session::Create(Triple TT,
+                                                   SubtargetFeatures Features) {
 
   std::unique_ptr<ExecutorProcessControl> EPC;
   if (OutOfProcessExecutor.getNumOccurrences()) {
@@ -923,6 +923,7 @@ Expected<std::unique_ptr<Session>> Session::Create(Triple TT) {
   std::unique_ptr<Session> S(new Session(std::move(EPC), Err));
   if (Err)
     return std::move(Err);
+  S->Features = std::move(Features);
   return std::move(S);
 }
 
@@ -989,6 +990,10 @@ Session::Session(std::unique_ptr<ExecutorProcessControl> EPC, Error &Err)
     ObjLayer.addPlugin(ExitOnErr(
         GDBJITDebugInfoRegistrationPlugin::Create(this->ES, *MainJD, TT)));
 
+  if (PerfSupport && TT.isOSBinFormatELF())
+    ObjLayer.addPlugin(ExitOnErr(PerfSupportPlugin::Create(
+        this->ES.getExecutorProcessControl(), *MainJD, true)));
+
   // Set up the platform.
   if (TT.isOSBinFormatMachO() && !OrcRuntime.empty()) {
     if (auto P =
@@ -1008,7 +1013,7 @@ Session::Session(std::unique_ptr<ExecutorProcessControl> EPC, Error &Err)
     }
   } else if (TT.isOSBinFormatCOFF() && !OrcRuntime.empty()) {
     auto LoadDynLibrary = [&, this](JITDylib &JD, StringRef DLLName) -> Error {
-      if (!DLLName.endswith_insensitive(".dll"))
+      if (!DLLName.ends_with_insensitive(".dll"))
         return make_error<StringError>("DLLName not ending with .dll",
                                        inconvertibleErrorCode());
       return loadAndLinkDynamicLibrary(JD, DLLName);
@@ -1103,17 +1108,6 @@ void Session::modifyPassConfig(const Triple &TT,
 
   PassConfig.PrePrunePasses.push_back(
       [this](LinkGraph &G) { return applyHarnessPromotions(*this, G); });
-
-  if (ShowSizes) {
-    PassConfig.PrePrunePasses.push_back([this](LinkGraph &G) -> Error {
-      SizeBeforePruning += computeTotalBlockSizes(G);
-      return Error::success();
-    });
-    PassConfig.PostFixupPasses.push_back([this](LinkGraph &G) -> Error {
-      SizeAfterFixups += computeTotalBlockSizes(G);
-      return Error::success();
-    });
-  }
 
   if (ShowRelocatedSectionContents)
     PassConfig.PostFixupPasses.push_back([](LinkGraph &G) -> Error {
@@ -1223,8 +1217,8 @@ Session::findSymbolInfo(StringRef SymbolName, Twine ErrorMsgStem) {
 
 } // end namespace llvm
 
-static Triple getFirstFileTriple() {
-  static Triple FirstTT = []() {
+static std::pair<Triple, SubtargetFeatures> getFirstFileTripleAndFeatures() {
+  static std::pair<Triple, SubtargetFeatures> FirstTTAndFeatures = []() {
     assert(!InputFiles.empty() && "InputFiles can not be empty");
     for (auto InputFile : InputFiles) {
       auto ObjBuffer = ExitOnErr(getFile(InputFile));
@@ -1241,16 +1235,19 @@ static Triple getFirstFileTriple() {
           TT.setObjectFormat(Triple::COFF);
           TT.setOS(Triple::OSType::Win32);
         }
-        return TT;
+        SubtargetFeatures Features;
+        if (auto ObjFeatures = Obj->getFeatures())
+          Features = std::move(*ObjFeatures);
+        return std::make_pair(TT, Features);
       }
       default:
         break;
       }
     }
-    return Triple();
+    return std::make_pair(Triple(), SubtargetFeatures());
   }();
 
-  return FirstTT;
+  return FirstTTAndFeatures;
 }
 
 static Error sanitizeArguments(const Triple &TT, const char *ArgV0) {
@@ -1406,7 +1403,8 @@ static Error addAbsoluteSymbols(Session &S,
       return Err;
 
     // Register the absolute symbol with the session symbol infos.
-    S.SymbolInfos[Name] = {ArrayRef<char>(), Addr};
+    S.SymbolInfos[Name] = {ArrayRef<char>(), Addr,
+                           AbsDef.getFlags().getTargetFlags()};
   }
 
   return Error::success();
@@ -1648,7 +1646,7 @@ static Error addLibraries(Session &S,
     for (auto FileName : (*G)->getImportedDynamicLibraries()) {
       LibraryLoad NewLL;
       auto FileNameRef = StringRef(FileName);
-      if (!FileNameRef.endswith_insensitive(".dll"))
+      if (!FileNameRef.ends_with_insensitive(".dll"))
         return make_error<StringError>(
             "COFF Imported library not ending with dll extension?",
             inconvertibleErrorCode());
@@ -1808,7 +1806,9 @@ struct TargetInfo {
 };
 } // anonymous namespace
 
-static TargetInfo getTargetInfo(const Triple &TT) {
+static TargetInfo
+getTargetInfo(const Triple &TT,
+              const SubtargetFeatures &TF = SubtargetFeatures()) {
   auto TripleName = TT.str();
   std::string ErrorStr;
   const Target *TheTarget = TargetRegistry::lookupTarget(TripleName, ErrorStr);
@@ -1818,7 +1818,7 @@ static TargetInfo getTargetInfo(const Triple &TT) {
                                       inconvertibleErrorCode()));
 
   std::unique_ptr<MCSubtargetInfo> STI(
-      TheTarget->createMCSubtargetInfo(TripleName, "", ""));
+      TheTarget->createMCSubtargetInfo(TripleName, "", TF.getString()));
   if (!STI)
     ExitOnErr(
         make_error<StringError>("Unable to create subtarget for " + TripleName,
@@ -1872,14 +1872,11 @@ static TargetInfo getTargetInfo(const Triple &TT) {
           std::move(MAI), std::move(Ctx), std::move(Disassembler),
           std::move(MII), std::move(MIA), std::move(InstPrinter)};
 }
-
-static Error runChecks(Session &S) {
+static Error runChecks(Session &S, Triple TT, SubtargetFeatures Features) {
   if (CheckFiles.empty())
     return Error::success();
 
   LLVM_DEBUG(dbgs() << "Running checks...\n");
-
-  auto TI = getTargetInfo(S.ES.getTargetTriple());
 
   auto IsSymbolValid = [&S](StringRef Symbol) {
     return S.isSymbolRegistered(Symbol);
@@ -1904,7 +1901,7 @@ static Error runChecks(Session &S) {
   RuntimeDyldChecker Checker(
       IsSymbolValid, GetSymbolInfo, GetSectionInfo, GetStubInfo, GetGOTInfo,
       S.ES.getTargetTriple().isLittleEndian() ? support::little : support::big,
-      TI.Disassembler.get(), TI.InstPrinter.get(), dbgs());
+      TT, StringRef(), Features, dbgs());
 
   std::string CheckLineStart = "# " + CheckName + ":";
   for (auto &CheckFile : CheckFiles) {
@@ -1925,19 +1922,6 @@ static Error addSelfRelocations(LinkGraph &G) {
               *Sym, G, *TI.Disassembler, *TI.MIA))
         return Err;
   return Error::success();
-}
-
-static void dumpSessionStats(Session &S) {
-  if (!ShowSizes)
-    return;
-  if (!OrcRuntime.empty())
-    outs() << "Note: Session stats include runtime and entry point lookup, but "
-              "not JITDylib initialization/deinitialization.\n";
-  if (ShowSizes)
-    outs() << "  Total size of all blocks before pruning: "
-           << S.SizeBeforePruning
-           << "\n  Total size of all blocks after fixups: " << S.SizeAfterFixups
-           << "\n";
 }
 
 static Expected<ExecutorSymbolDef> getMainEntryPoint(Session &S) {
@@ -2026,9 +2010,12 @@ int main(int argc, char *argv[]) {
   std::unique_ptr<JITLinkTimers> Timers =
       ShowTimes ? std::make_unique<JITLinkTimers>() : nullptr;
 
-  ExitOnErr(sanitizeArguments(getFirstFileTriple(), argv[0]));
+  auto [TT, Features] = getFirstFileTripleAndFeatures();
+  ExitOnErr(sanitizeArguments(TT, argv[0]));
 
-  auto S = ExitOnErr(Session::Create(getFirstFileTriple()));
+  auto S = ExitOnErr(Session::Create(TT, Features));
+
+  enableStatistics(*S, !OrcRuntime.empty());
 
   {
     TimeRegion TR(Timers ? &Timers->LoadObjectsTimer : nullptr);
@@ -2055,8 +2042,6 @@ int main(int argc, char *argv[]) {
   if (ShowAddrs)
     S->dumpSessionInfo(outs());
 
-  dumpSessionStats(*S);
-
   if (!EntryPoint) {
     if (Timers)
       Timers->JITLinkTG.printAll(errs());
@@ -2064,13 +2049,10 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  ExitOnErr(runChecks(*S));
-
-  if (NoExec)
-    return 0;
+  ExitOnErr(runChecks(*S, std::move(TT), std::move(Features)));
 
   int Result = 0;
-  {
+  if (!NoExec) {
     LLVM_DEBUG(dbgs() << "Running \"" << EntryPointName << "\"...\n");
     TimeRegion TR(Timers ? &Timers->RunTimer : nullptr);
     if (!OrcRuntime.empty())

@@ -123,6 +123,9 @@ public:
   /// Insert an unlinked instruction into a basic block immediately before
   /// the specified instruction.
   void insertBefore(Instruction *InsertPos);
+  void insertBefore(SymbolTableList<Instruction>::iterator InsertPos) {
+    insertBefore(&*InsertPos);
+  }
 
   /// Insert an unlinked instruction into a basic block immediately after the
   /// specified instruction.
@@ -133,18 +136,42 @@ public:
   SymbolTableList<Instruction>::iterator
   insertInto(BasicBlock *ParentBB, SymbolTableList<Instruction>::iterator It);
 
+  void insertBefore(BasicBlock &BB,
+                    SymbolTableList<Instruction>::iterator InsertPos) {
+    insertInto(&BB, InsertPos);
+  }
+
   /// Unlink this instruction from its current basic block and insert it into
   /// the basic block that MovePos lives in, right before MovePos.
   void moveBefore(Instruction *MovePos);
+
+  /// Perform a \ref moveBefore operation, while signalling that the caller
+  /// intends to preserve the original ordering of instructions. This implicitly
+  /// means that any adjacent debug-info should move with this instruction.
+  /// This method is currently a no-op placeholder, but it will become meaningful
+  /// when the "RemoveDIs" project is enabled.
+  void moveBeforePreserving(Instruction *MovePos) {
+    moveBefore(MovePos);
+  }
 
   /// Unlink this instruction and insert into BB before I.
   ///
   /// \pre I is a valid iterator into BB.
   void moveBefore(BasicBlock &BB, SymbolTableList<Instruction>::iterator I);
 
+  /// (See other overload for moveBeforePreserving).
+  void moveBeforePreserving(BasicBlock &BB, SymbolTableList<Instruction>::iterator I) {
+    moveBefore(BB, I);
+  }
+
   /// Unlink this instruction from its current basic block and insert it into
   /// the basic block that MovePos lives in, right after MovePos.
   void moveAfter(Instruction *MovePos);
+
+  /// See \ref moveBeforePreserving .
+  void moveAfterPreserving(Instruction *MovePos) {
+    moveAfter(MovePos);
+  }
 
   /// Given an instruction Other in the same basic block as this instruction,
   /// return true if this instruction comes before Other. In this worst case,
@@ -175,9 +202,7 @@ public:
   bool isShift() const { return isShift(getOpcode()); }
   bool isCast() const { return isCast(getOpcode()); }
   bool isFuncletPad() const { return isFuncletPad(getOpcode()); }
-  bool isExceptionalTerminator() const {
-    return isExceptionalTerminator(getOpcode());
-  }
+  bool isSpecialTerminator() const { return isSpecialTerminator(getOpcode()); }
 
   /// It checks if this instruction is the only user of at least one of
   /// its operands.
@@ -235,14 +260,16 @@ public:
     return Opcode >= FuncletPadOpsBegin && Opcode < FuncletPadOpsEnd;
   }
 
-  /// Returns true if the Opcode is a terminator related to exception handling.
-  static inline bool isExceptionalTerminator(unsigned Opcode) {
+  /// Returns true if the Opcode is a "special" terminator that does more than
+  /// branch to a successor (e.g. have a side effect or return a value).
+  static inline bool isSpecialTerminator(unsigned Opcode) {
     switch (Opcode) {
     case Instruction::CatchSwitch:
     case Instruction::CatchRet:
     case Instruction::CleanupRet:
     case Instruction::Invoke:
     case Instruction::Resume:
+    case Instruction::CallBr:
       return true;
     default:
       return false;
@@ -339,12 +366,19 @@ public:
   /// If this instruction already has !annotation metadata, append \p Annotation
   /// to the existing node.
   void addAnnotationMetadata(StringRef Annotation);
-
+  /// Adds an !annotation metadata node with an array of \p Annotations
+  /// as a tuple to this instruction. If this instruction already has
+  /// !annotation metadata, append the tuple to
+  /// the existing node.
+  void addAnnotationMetadata(SmallVector<StringRef> Annotations);
   /// Returns the AA metadata for this instruction.
   AAMDNodes getAAMetadata() const;
 
   /// Sets the AA metadata on this instruction from the AAMDNodes structure.
   void setAAMetadata(const AAMDNodes &N);
+
+  /// Sets the nosanitize metadata on this instruction.
+  void setNoSanitizeMetadata();
 
   /// Retrieve total raw weight values of a branch.
   /// Returns true on success with profile total weights filled in.
@@ -356,6 +390,10 @@ public:
 
   /// Return the debug location for this node as a DebugLoc.
   const DebugLoc &getDebugLoc() const { return DbgLoc; }
+
+  /// Fetch the debug location for this node, unless this is a debug intrinsic,
+  /// in which case fetch the debug location of the next non-debug node.
+  const DebugLoc &getStableDebugLoc() const;
 
   /// Set or clear the nuw flag on this instruction, which must be an operator
   /// which supports this flag. See LangRef.html for the meaning of this flag.
@@ -401,10 +439,15 @@ public:
   }
 
   /// This function drops non-debug unknown metadata (through
-  /// dropUnknownNonDebugMetadata). For calls, it also drops parameter and 
+  /// dropUnknownNonDebugMetadata). For calls, it also drops parameter and
   /// return attributes that can cause undefined behaviour. Both of these should
   /// be done by passes which move instructions in IR.
   void dropUBImplyingAttrsAndUnknownMetadata(ArrayRef<unsigned> KnownIDs = {});
+
+  /// Drop any attributes or metadata that can cause immediate undefined
+  /// behavior. Retain other attributes/metadata on a best-effort basis.
+  /// This should be used when speculating instructions.
+  void dropUBImplyingAttrsAndMetadata();
 
   /// Determine whether the exact flag is set.
   bool isExact() const LLVM_READONLY;
@@ -512,7 +555,7 @@ public:
   ///     applications, thus the N-way merging should be in code path.
   /// The DebugLoc attached to this instruction will be overwritten by the
   /// merged DebugLoc.
-  void applyMergedLocation(const DILocation *LocA, const DILocation *LocB);
+  void applyMergedLocation(DILocation *LocA, DILocation *LocB);
 
   /// Updates the debug location given that the instruction has been hoisted
   /// from a block to a predecessor of that block.
@@ -635,8 +678,15 @@ public:
   /// Return true if this instruction has a volatile memory access.
   bool isVolatile() const LLVM_READONLY;
 
+  /// Return the type this instruction accesses in memory, if any.
+  Type *getAccessType() const LLVM_READONLY;
+
   /// Return true if this instruction may throw an exception.
-  bool mayThrow() const LLVM_READONLY;
+  ///
+  /// If IncludePhaseOneUnwind is set, this will also include cases where
+  /// phase one unwinding may unwind past this frame due to skipping of
+  /// cleanup landingpads.
+  bool mayThrow(bool IncludePhaseOneUnwind = false) const LLVM_READONLY;
 
   /// Return true if this instruction behaves like a memory fence: it can load
   /// or store to memory location without being given a memory location.

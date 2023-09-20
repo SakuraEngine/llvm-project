@@ -1,11 +1,11 @@
 // RUN: mlir-opt %s -sparsification | FileCheck %s
 
 #DenseMatrix = #sparse_tensor.encoding<{
-  dimLevelType = ["dense", "dense"]
+  map = (d0, d1) -> (d0 : dense, d1 : dense)
 }>
 
 #SparseMatrix = #sparse_tensor.encoding<{
-  dimLevelType = ["compressed", "compressed"]
+  map = (d0, d1) -> (d0 : compressed, d1 : compressed)
 }>
 
 #trait = {

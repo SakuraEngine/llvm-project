@@ -22,6 +22,7 @@
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
+#include "clang/Sema/EnterExpressionEvaluationContext.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/ScopeInfo.h"
@@ -94,11 +95,14 @@ static void instantiateDependentAlignedAttr(
     if (!Result.isInvalid())
       S.AddAlignedAttr(New, *Aligned, Result.getAs<Expr>(), IsPackExpansion);
   } else {
-    TypeSourceInfo *Result = S.SubstType(Aligned->getAlignmentType(),
-                                         TemplateArgs, Aligned->getLocation(),
-                                         DeclarationName());
-    if (Result)
-      S.AddAlignedAttr(New, *Aligned, Result, IsPackExpansion);
+    if (TypeSourceInfo *Result =
+            S.SubstType(Aligned->getAlignmentType(), TemplateArgs,
+                        Aligned->getLocation(), DeclarationName())) {
+      if (!S.CheckAlignasTypeArgument(Aligned->getSpelling(), Result,
+                                      Aligned->getLocation(),
+                                      Result->getTypeLoc().getSourceRange()))
+        S.AddAlignedAttr(New, *Aligned, Result, IsPackExpansion);
+    }
   }
 }
 
@@ -1425,11 +1429,14 @@ Decl *TemplateDeclInstantiator::VisitStaticAssertDecl(StaticAssertDecl *D) {
   if (InstantiatedAssertExpr.isInvalid())
     return nullptr;
 
-  return SemaRef.BuildStaticAssertDeclaration(D->getLocation(),
-                                              InstantiatedAssertExpr.get(),
-                                              D->getMessage(),
-                                              D->getRParenLoc(),
-                                              D->isFailed());
+  ExprResult InstantiatedMessageExpr =
+      SemaRef.SubstExpr(D->getMessage(), TemplateArgs);
+  if (InstantiatedMessageExpr.isInvalid())
+    return nullptr;
+
+  return SemaRef.BuildStaticAssertDeclaration(
+      D->getLocation(), InstantiatedAssertExpr.get(),
+      InstantiatedMessageExpr.get(), D->getRParenLoc(), D->isFailed());
 }
 
 Decl *TemplateDeclInstantiator::VisitEnumDecl(EnumDecl *D) {
@@ -1676,6 +1683,7 @@ Decl *TemplateDeclInstantiator::VisitClassTemplateDecl(ClassTemplateDecl *D) {
     RecordInst->setLexicalDeclContext(Owner);
 
     if (PrevClassTemplate) {
+      Inst->setCommonPtr(PrevClassTemplate->getCommonPtr());
       RecordInst->setTypeForDecl(
           PrevClassTemplate->getTemplatedDecl()->getTypeForDecl());
       const ClassTemplateDecl *MostRecentPrevCT =
@@ -2124,9 +2132,8 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     Function = CXXDeductionGuideDecl::Create(
         SemaRef.Context, DC, D->getInnerLocStart(),
         InstantiatedExplicitSpecifier, NameInfo, T, TInfo,
-        D->getSourceRange().getEnd());
-    if (DGuide->isCopyDeductionCandidate())
-      cast<CXXDeductionGuideDecl>(Function)->setIsCopyDeductionCandidate();
+        D->getSourceRange().getEnd(), /*Ctor=*/nullptr,
+        DGuide->getDeductionCandidateKind());
     Function->setAccess(D->getAccess());
   } else {
     Function = FunctionDecl::Create(
@@ -2293,7 +2300,7 @@ Decl *TemplateDeclInstantiator::VisitFunctionDecl(
     // Filter out previous declarations that don't match the scope. The only
     // effect this has is to remove declarations found in inline namespaces
     // for friend declarations with unqualified names.
-    if (isFriend && !QualifierLoc && !FunctionTemplate) {
+    if (isFriend && !QualifierLoc) {
       SemaRef.FilterLookupForScope(Previous, DC, /*Scope=*/ nullptr,
                                    /*ConsiderLinkage=*/ true,
                                    QualifierLoc.hasQualifier());
@@ -2419,6 +2426,9 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
       cast<Decl>(Owner)->isDefinedOutsideFunctionOrMethod());
   LocalInstantiationScope Scope(SemaRef, MergeWithParentScope);
 
+  Sema::LambdaScopeForCallOperatorInstantiationRAII LambdaScope(
+      SemaRef, const_cast<CXXMethodDecl *>(D), TemplateArgs, Scope);
+
   // Instantiate enclosing template arguments for friends.
   SmallVector<TemplateParameterList *, 4> TempParamLists;
   unsigned NumTempParamLists = 0;
@@ -2522,9 +2532,6 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
         Constructor->getConstexprKind(), InheritedConstructor(),
         TrailingRequiresClause);
     Method->setRangeEnd(Constructor->getEndLoc());
-    if (Constructor->isDefaultConstructor() ||
-        Constructor->isCopyOrMoveConstructor())
-      Method->setIneligibleOrNotSelected(true);
   } else if (CXXDestructorDecl *Destructor = dyn_cast<CXXDestructorDecl>(D)) {
     Method = CXXDestructorDecl::Create(
         SemaRef.Context, Record, StartLoc, NameInfo, T, TInfo,
@@ -2547,8 +2554,6 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
         SemaRef.Context, Record, StartLoc, NameInfo, T, TInfo, SC,
         D->UsesFPIntrin(), D->isInlineSpecified(), D->getConstexprKind(),
         D->getEndLoc(), TrailingRequiresClause);
-    if (D->isMoveAssignmentOperator() || D->isCopyAssignmentOperator())
-      Method->setIneligibleOrNotSelected(true);
   }
 
   if (D->isInlined())
@@ -2750,6 +2755,22 @@ Decl *TemplateDeclInstantiator::VisitCXXMethodDecl(
   // FIXME: Is this necessary?
   if (IsExplicitSpecialization && !isFriend)
     SemaRef.CompleteMemberSpecialization(Method, Previous);
+
+  // If the method is a special member function, we need to mark it as
+  // ineligible so that Owner->addDecl() won't mark the class as non trivial.
+  // At the end of the class instantiation, we calculate eligibility again and
+  // then we adjust trivility if needed.
+  // We need this check to happen only after the method parameters are set,
+  // because being e.g. a copy constructor depends on the instantiated
+  // arguments.
+  if (auto *Constructor = dyn_cast<CXXConstructorDecl>(Method)) {
+    if (Constructor->isDefaultConstructor() ||
+        Constructor->isCopyOrMoveConstructor())
+      Method->setIneligibleOrNotSelected(true);
+  } else if (Method->isCopyAssignmentOperator() ||
+             Method->isMoveAssignmentOperator()) {
+    Method->setIneligibleOrNotSelected(true);
+  }
 
   // If there's a function template, let our caller handle it.
   if (FunctionTemplate) {
@@ -4662,11 +4683,7 @@ TemplateDeclInstantiator::InitFunctionInstantiation(FunctionDecl *New,
   ActiveInstType &ActiveInst = SemaRef.CodeSynthesisContexts.back();
   if (ActiveInst.Kind == ActiveInstType::ExplicitTemplateArgumentSubstitution ||
       ActiveInst.Kind == ActiveInstType::DeducedTemplateArgumentSubstitution) {
-    if (FunctionTemplateDecl *FunTmpl
-          = dyn_cast<FunctionTemplateDecl>(ActiveInst.Entity)) {
-      assert(FunTmpl->getTemplatedDecl() == Tmpl &&
-             "Deduction from the wrong function template?");
-      (void) FunTmpl;
+    if (isa<FunctionTemplateDecl>(ActiveInst.Entity)) {
       SemaRef.InstantiatingSpecializations.erase(
           {ActiveInst.Entity->getCanonicalDecl(), ActiveInst.Kind});
       atTemplateEnd(SemaRef.TemplateInstCallbacks, SemaRef, ActiveInst);
@@ -4973,8 +4990,10 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
   // unimported module.
   Function->setVisibleDespiteOwningModule();
 
-  // Copy the inner loc start from the pattern.
+  // Copy the source locations from the pattern.
+  Function->setLocation(PatternDecl->getLocation());
   Function->setInnerLocStart(PatternDecl->getInnerLocStart());
+  Function->setRangeEnd(PatternDecl->getEndLoc());
 
   EnterExpressionEvaluationContext EvalContext(
       *this, Sema::ExpressionEvaluationContext::PotentiallyEvaluated);
@@ -5048,6 +5067,7 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
     } IR{*this, PatternRec, NewRec};
 
     TypeSourceInfo *NewSI = IR.TransformType(Function->getTypeSourceInfo());
+    assert(NewSI && "Type Transform failed?");
     Function->setType(NewSI->getType());
     Function->setTypeSourceInfo(NewSI);
 
@@ -5075,6 +5095,10 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
     // Enter the scope of this instantiation. We don't use
     // PushDeclContext because we don't have a scope.
     Sema::ContextRAII savedContext(*this, Function);
+
+    FPFeaturesStateRAII SavedFPFeatures(*this);
+    CurFPFeatures = FPOptions(getLangOpts());
+    FpPragmaStack.CurrentValue = FPOptionsOverride();
 
     if (addInstantiatedParametersToScope(Function, PatternDecl, Scope,
                                          TemplateArgs))

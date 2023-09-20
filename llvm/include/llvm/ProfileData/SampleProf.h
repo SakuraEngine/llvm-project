@@ -90,7 +90,7 @@ namespace sampleprof {
 enum SampleProfileFormat {
   SPF_None = 0,
   SPF_Text = 0x1,
-  SPF_Compact_Binary = 0x2,
+  SPF_Compact_Binary = 0x2, // Deprecated
   SPF_GCC = 0x3,
   SPF_Ext_Binary = 0x4,
   SPF_Binary = 0xff
@@ -169,7 +169,7 @@ struct SecHdrTableEntry {
   uint64_t Size;
   // The index indicating the location of the current entry in
   // SectionHdrLayout table.
-  uint32_t LayoutIndex;
+  uint64_t LayoutIndex;
 };
 
 // Flags common for all sections are defined here. In SecHdrTableEntry::Flags,
@@ -317,6 +317,14 @@ struct LineLocationHash {
 };
 
 raw_ostream &operator<<(raw_ostream &OS, const LineLocation &Loc);
+
+static inline uint64_t hashFuncName(StringRef F) {
+  // If function name is already MD5 string, do not hash again.
+  uint64_t Hash;
+  if (F.getAsInteger(10, Hash))
+    Hash = MD5Hash(F);
+  return Hash;
+}
 
 /// Representation of a single sample record.
 ///
@@ -525,7 +533,9 @@ public:
   SampleContext() : State(UnknownContext), Attributes(ContextNone) {}
 
   SampleContext(StringRef Name)
-      : Name(Name), State(UnknownContext), Attributes(ContextNone) {}
+      : Name(Name), State(UnknownContext), Attributes(ContextNone) {
+        assert(!Name.empty() && "Name is empty");
+      }
 
   SampleContext(SampleContextFrames Context,
                 ContextStateMask CState = RawContext)
@@ -631,8 +641,12 @@ public:
   }
 
   uint64_t getHashCode() const {
-    return hasContext() ? hash_value(getContextFrames())
-                        : hash_value(getName());
+    if (hasContext())
+      return hash_value(getContextFrames());
+
+    // For non-context function name, use its MD5 as hash value, so that it is
+    // consistent with the profile map's key.
+    return hashFuncName(getName());
   }
 
   /// Set the name of the function and clear the current context.
@@ -710,9 +724,12 @@ private:
   uint32_t Attributes;
 };
 
-static inline hash_code hash_value(const SampleContext &arg) {
-  return arg.hasContext() ? hash_value(arg.getContextFrames())
-                          : hash_value(arg.getName());
+static inline hash_code hash_value(const SampleContext &Context) {
+  return Context.getHashCode();
+}
+
+inline raw_ostream &operator<<(raw_ostream &OS, const SampleContext &Context) {
+  return OS << Context.toString();
 }
 
 class FunctionSamples;
@@ -723,6 +740,8 @@ using BodySampleMap = std::map<LineLocation, SampleRecord>;
 // memory, which is *very* significant for large profiles.
 using FunctionSamplesMap = std::map<std::string, FunctionSamples, std::less<>>;
 using CallsiteSampleMap = std::map<LineLocation, FunctionSamplesMap>;
+using LocToLocMap =
+    std::unordered_map<LineLocation, LineLocation, LineLocationHash>;
 
 /// Representation of the samples collected for a function.
 ///
@@ -798,11 +817,10 @@ public:
     return Count;
   }
 
-  sampleprof_error addBodySamplesForProbe(uint32_t Index, uint64_t Num,
-                                          uint64_t Weight = 1) {
-    SampleRecord S;
-    S.addSamples(Num, Weight);
-    return BodySamples[LineLocation(Index, 0)].merge(S, Weight);
+  // Remove all call site samples for inlinees. This is needed when flattening
+  // a nested profile.
+  void removeAllCallsiteSamples() {
+    CallsiteSamples.clear();
   }
 
   // Accumulate all call target samples to update the body samples.
@@ -842,12 +860,26 @@ public:
     }
   }
 
+  // Query the stale profile matching results and remap the location.
+  const LineLocation &mapIRLocToProfileLoc(const LineLocation &IRLoc) const {
+    // There is no remapping if the profile is not stale or the matching gives
+    // the same location.
+    if (!IRToProfileLocationMap)
+      return IRLoc;
+    const auto &ProfileLoc = IRToProfileLocationMap->find(IRLoc);
+    if (ProfileLoc != IRToProfileLocationMap->end())
+      return ProfileLoc->second;
+    else
+      return IRLoc;
+  }
+
   /// Return the number of samples collected at the given location.
   /// Each location is specified by \p LineOffset and \p Discriminator.
   /// If the location is not found in profile, return error.
   ErrorOr<uint64_t> findSamplesAt(uint32_t LineOffset,
                                   uint32_t Discriminator) const {
-    const auto &ret = BodySamples.find(LineLocation(LineOffset, Discriminator));
+    const auto &ret = BodySamples.find(
+        mapIRLocToProfileLoc(LineLocation(LineOffset, Discriminator)));
     if (ret == BodySamples.end())
       return std::error_code();
     return ret->second.getSamples();
@@ -858,7 +890,8 @@ public:
   /// If the location is not found in profile, return error.
   ErrorOr<SampleRecord::CallTargetMap>
   findCallTargetMapAt(uint32_t LineOffset, uint32_t Discriminator) const {
-    const auto &ret = BodySamples.find(LineLocation(LineOffset, Discriminator));
+    const auto &ret = BodySamples.find(
+        mapIRLocToProfileLoc(LineLocation(LineOffset, Discriminator)));
     if (ret == BodySamples.end())
       return std::error_code();
     return ret->second.getCallTargets();
@@ -868,7 +901,7 @@ public:
   /// CallSite. If the location is not found in profile, return error.
   ErrorOr<SampleRecord::CallTargetMap>
   findCallTargetMapAt(const LineLocation &CallSite) const {
-    const auto &Ret = BodySamples.find(CallSite);
+    const auto &Ret = BodySamples.find(mapIRLocToProfileLoc(CallSite));
     if (Ret == BodySamples.end())
       return std::error_code();
     return Ret->second.getCallTargets();
@@ -876,13 +909,13 @@ public:
 
   /// Return the function samples at the given callsite location.
   FunctionSamplesMap &functionSamplesAt(const LineLocation &Loc) {
-    return CallsiteSamples[Loc];
+    return CallsiteSamples[mapIRLocToProfileLoc(Loc)];
   }
 
   /// Returns the FunctionSamplesMap at the given \p Loc.
   const FunctionSamplesMap *
   findFunctionSamplesMapAt(const LineLocation &Loc) const {
-    auto iter = CallsiteSamples.find(Loc);
+    auto iter = CallsiteSamples.find(mapIRLocToProfileLoc(Loc));
     if (iter == CallsiteSamples.end())
       return nullptr;
     return &iter->second;
@@ -946,8 +979,6 @@ public:
   const CallsiteSampleMap &getCallsiteSamples() const {
     return CallsiteSamples;
   }
-
-  CallsiteSampleMap &getCallsiteSamples() { return CallsiteSamples; }
 
   /// Return the maximum of sample counts in a function body. When SkipCallSite
   /// is false, which is the default, the return count includes samples in the
@@ -1045,6 +1076,11 @@ public:
   void setFunctionHash(uint64_t Hash) { FunctionHash = Hash; }
 
   uint64_t getFunctionHash() const { return FunctionHash; }
+
+  void setIRToProfileLocationMap(const LocToLocMap *LTLM) {
+    assert(IRToProfileLocationMap == nullptr && "this should be set only once");
+    IRToProfileLocationMap = LTLM;
+  }
 
   /// Return the canonical name for a function, taking into account
   /// suffix elision policy attributes.
@@ -1187,6 +1223,9 @@ public:
     return !(*this == Other);
   }
 
+  template <typename T>
+  const T &getKey() const;
+
 private:
   /// CFG hash value for the function.
   uint64_t FunctionHash = 0;
@@ -1229,14 +1268,152 @@ private:
   /// in the call to bar() at line offset 1, the other for all the samples
   /// collected in the call to baz() at line offset 8.
   CallsiteSampleMap CallsiteSamples;
+
+  /// IR to profile location map generated by stale profile matching.
+  ///
+  /// Each entry is a mapping from the location on current build to the matched
+  /// location in the "stale" profile. For example:
+  ///   Profiled source code:
+  ///      void foo() {
+  ///   1    bar();
+  ///      }
+  ///
+  ///   Current source code:
+  ///      void foo() {
+  ///   1    // Code change
+  ///   2    bar();
+  ///      }
+  /// Supposing the stale profile matching algorithm generated the mapping [2 ->
+  /// 1], the profile query using the location of bar on the IR which is 2 will
+  /// be remapped to 1 and find the location of bar in the profile.
+  const LocToLocMap *IRToProfileLocationMap = nullptr;
 };
+
+template <>
+inline const SampleContext &FunctionSamples::getKey<SampleContext>() const {
+  return getContext();
+}
 
 raw_ostream &operator<<(raw_ostream &OS, const FunctionSamples &FS);
 
-using SampleProfileMap =
-    std::unordered_map<SampleContext, FunctionSamples, SampleContext::Hash>;
+/// This class is a wrapper to associative container MapT<KeyT, ValueT> using
+/// the hash value of the original key as the new key. This greatly improves the
+/// performance of insert and query operations especially when hash values of
+/// keys are available a priori, and reduces memory usage if KeyT has a large
+/// size.
+/// All keys with the same hash value are considered equivalent (i.e. hash
+/// collision is silently ignored). Given such feature this class should only be
+/// used where it does not affect compilation correctness, for example, when
+/// loading a sample profile.
+/// Assuming the hashing algorithm is uniform, we use the formula
+/// 1 - Permute(n, k) / n ^ k where n is the universe size and k is number of
+/// elements chosen at random to calculate the probability of collision. With
+/// 1,000,000 entries the probability is negligible:
+/// 1 - (2^64)!/((2^64-1000000)!*(2^64)^1000000) ~= 3*10^-8.
+/// Source: https://en.wikipedia.org/wiki/Birthday_problem
+template <template <typename, typename, typename...> typename MapT,
+          typename KeyT, typename ValueT, typename... MapTArgs>
+class HashKeyMap : public MapT<hash_code, ValueT, MapTArgs...> {
+public:
+  using base_type = MapT<hash_code, ValueT, MapTArgs...>;
+  using key_type = hash_code;
+  using original_key_type = KeyT;
+  using mapped_type = ValueT;
+  using value_type = typename base_type::value_type;
 
-using NameFunctionSamples = std::pair<SampleContext, const FunctionSamples *>;
+  using iterator = typename base_type::iterator;
+  using const_iterator = typename base_type::const_iterator;
+
+  template <typename... Ts>
+  std::pair<iterator, bool> try_emplace(const key_type &Hash,
+                                        const original_key_type &Key,
+                                        Ts &&...Args) {
+    assert(Hash == hash_value(Key));
+    return base_type::try_emplace(Hash, std::forward<Ts>(Args)...);
+  }
+
+  template <typename... Ts>
+  std::pair<iterator, bool> try_emplace(const original_key_type &Key,
+                                        Ts &&...Args) {
+    key_type Hash = hash_value(Key);
+    return try_emplace(Hash, Key, std::forward<Ts>(Args)...);
+  }
+
+  template <typename... Ts> std::pair<iterator, bool> emplace(Ts &&...Args) {
+    return try_emplace(std::forward<Ts>(Args)...);
+  }
+
+  mapped_type &operator[](const original_key_type &Key) {
+    return try_emplace(Key, mapped_type()).first->second;
+  }
+
+  iterator find(const original_key_type &Key) {
+    key_type Hash = hash_value(Key);
+    auto It = base_type::find(Hash);
+    if (It != base_type::end())
+      return It;
+    return base_type::end();
+  }
+
+  const_iterator find(const original_key_type &Key) const {
+    key_type Hash = hash_value(Key);
+    auto It = base_type::find(Hash);
+    if (It != base_type::end())
+      return It;
+    return base_type::end();
+  }
+
+  size_t erase(const original_key_type &Ctx) {
+    auto It = find(Ctx);
+    if (It != base_type::end()) {
+      base_type::erase(It);
+      return 1;
+    }
+    return 0;
+  }
+};
+
+/// This class provides operator overloads to the map container using MD5 as the
+/// key type, so that existing code can still work in most cases using
+/// SampleContext as key.
+/// Note: when populating container, make sure to assign the SampleContext to
+/// the mapped value immediately because the key no longer holds it.
+class SampleProfileMap
+    : public HashKeyMap<std::unordered_map, SampleContext, FunctionSamples> {
+public:
+  // Convenience method because this is being used in many places. Set the
+  // FunctionSamples' context if its newly inserted.
+  mapped_type &Create(const SampleContext &Ctx) {
+    auto Ret = try_emplace(Ctx, FunctionSamples());
+    if (Ret.second)
+      Ret.first->second.setContext(Ctx);
+    return Ret.first->second;
+  }
+
+  iterator find(const SampleContext &Ctx) {
+    return HashKeyMap<std::unordered_map, SampleContext, FunctionSamples>::find(
+        Ctx);
+  }
+
+  const_iterator find(const SampleContext &Ctx) const {
+    return HashKeyMap<std::unordered_map, SampleContext, FunctionSamples>::find(
+        Ctx);
+  }
+
+  // Overloaded find() to lookup a function by name.
+  iterator find(StringRef Fname) {
+    return base_type::find(hashFuncName(Fname));
+  }
+
+  size_t erase(const SampleContext &Ctx) {
+    return HashKeyMap<std::unordered_map, SampleContext, FunctionSamples>::
+        erase(Ctx);
+  }
+
+  size_t erase(const key_type &Key) { return base_type::erase(Key); }
+};
+
+using NameFunctionSamples = std::pair<hash_code, const FunctionSamples *>;
 
 void sortFuncProfiles(const SampleProfileMap &ProfileMap,
                       std::vector<NameFunctionSamples> &SortedProfiles);
@@ -1282,8 +1459,6 @@ public:
                                        bool MergeColdContext,
                                        uint32_t ColdContextFrameLength,
                                        bool TrimBaseProfileOnly);
-  // Canonicalize context profile name and attributes.
-  void canonicalizeContextProfiles();
 
 private:
   SampleProfileMap &ProfileMap;
@@ -1329,12 +1504,12 @@ public:
                              SampleProfileMap &OutputProfiles,
                              bool ProfileIsCS = false) {
     if (ProfileIsCS) {
-      for (const auto &I : InputProfiles)
-        OutputProfiles[I.second.getName()].merge(I.second);
-      // Retain the profile name and clear the full context for each function
-      // profile.
-      for (auto &I : OutputProfiles)
-        I.second.setContext(SampleContext(I.first));
+      for (const auto &I : InputProfiles) {
+        // Retain the profile name and clear the full context for each function
+        // profile.
+        FunctionSamples &FS = OutputProfiles.Create(I.second.getName());
+        FS.merge(I.second);
+      }
     } else {
       for (const auto &I : InputProfiles)
         flattenNestedProfile(OutputProfiles, I.second);
@@ -1350,9 +1525,9 @@ private:
     auto Ret = OutputProfiles.try_emplace(Context, FS);
     FunctionSamples &Profile = Ret.first->second;
     if (Ret.second) {
-      // When it's the copy of the old profile, just clear all the inlinees'
-      // samples.
-      Profile.getCallsiteSamples().clear();
+      // Clear nested inlinees' samples for the flattened copy. These inlinees
+      // will have their own top-level entries after flattening.
+      Profile.removeAllCallsiteSamples();
       // We recompute TotalSamples later, so here set to zero.
       Profile.setTotalSamples(0);
     } else {
